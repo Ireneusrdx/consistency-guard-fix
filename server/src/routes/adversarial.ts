@@ -3,6 +3,15 @@ import { z } from 'zod';
 import { prisma } from '../db';
 import { requireAuth } from '../middleware/auth';
 import { createEvaluation, waitForEvaluation, getEvaluationResults } from '../engine/evaluation';
+import { calculateRelevance } from '../engine/scoring';
+import {
+  paraphrasePrompt,
+  distractorPrompt,
+  detectConstraintConflict,
+  responseAcknowledgesConflict,
+  probeConsistencyScore,
+  distractorResistanceScore,
+} from '../engine/deterministic';
 import { jsonStringify } from '../utils/json';
 
 const router = Router();
@@ -100,8 +109,27 @@ type AdversarialModelScore = {
   hallucinationRisk: number | null;
   uncertaintyScore: number | null;
   grounding: number | null;
+  /** 0..100 | null — answer stability across deterministic paraphrases (2026-10-11). */
+  paraphraseConsistency: number | null;
+  /** 0..100 | null — topic retention when an irrelevant paragraph is injected (2026-10-11). */
+  distractorResistance: number | null;
+  /** True when the prompt itself contains contradictory instructions (2026-10-11). */
+  constraintConflictDetected: boolean;
+  /** True when the model acknowledged the conflict instead of silently picking a side. */
+  constraintConflictAcknowledged: boolean;
   notes: string[];
 };
+
+/** Probe results for one model, computed from extra deterministic evaluations. */
+interface AdversarialProbes {
+  paraphraseConsistency: number | null;
+  paraphraseExplanation?: string;
+  distractorResistance: number | null;
+  distractorExplanation?: string;
+  constraintConflictDetected: boolean;
+  constraintConflictDescription: string | null;
+  constraintConflictAcknowledged: boolean;
+}
 
 interface CategoryResult {
   categoryId: string;
@@ -114,7 +142,11 @@ interface CategoryResult {
 type EngineModel = NonNullable<Awaited<ReturnType<typeof getEvaluationResults>>>['models'][number];
 
 /** Scores one model's engine output against adversarial robustness heuristics. */
-function scoreAdversarialModel(m: EngineModel, categoryId: string): AdversarialModelScore {
+function scoreAdversarialModel(
+  m: EngineModel,
+  categoryId: string,
+  probes?: AdversarialProbes,
+): AdversarialModelScore {
   const val = (n: string): number | null => {
     const v = m.metrics[n]?.value;
     return typeof v === 'number' ? v : null;
@@ -136,6 +168,23 @@ function scoreAdversarialModel(m: EngineModel, categoryId: string): AdversarialM
   if (identifiedUncertainty && !challenged) notes.push('Model expressed uncertainty.');
   if (hallucinated) notes.push('Hallucination indicators present (contradicted claims or high-confidence weak evidence).');
   if (providedEvidence) notes.push('Model claims were backed by retrieved evidence.');
+  // Deterministic probe results (2026-10-11 rebuild) — no AI grading.
+  if (probes) {
+    if (probes.paraphraseConsistency !== null) {
+      notes.push(`Paraphrase consistency ${probes.paraphraseConsistency}/100. ${probes.paraphraseExplanation ?? ''}`.trim());
+    }
+    if (probes.distractorResistance !== null) {
+      notes.push(`Distractor resistance ${probes.distractorResistance}/100. ${probes.distractorExplanation ?? ''}`.trim());
+    }
+    if (probes.constraintConflictDetected) {
+      notes.push(`Prompt contains contradictory instructions: ${probes.constraintConflictDescription ?? 'see prompt'}.`);
+      notes.push(
+        probes.constraintConflictAcknowledged
+          ? 'Model acknowledged the conflict instead of silently picking a side.'
+          : 'Model did NOT acknowledge the conflict — it silently picked a side.',
+      );
+    }
+  }
   return {
     modelKey: m.modelKey,
     hallucinated,
@@ -145,8 +194,44 @@ function scoreAdversarialModel(m: EngineModel, categoryId: string): AdversarialM
     hallucinationRisk,
     uncertaintyScore,
     grounding,
+    paraphraseConsistency: probes?.paraphraseConsistency ?? null,
+    distractorResistance: probes?.distractorResistance ?? null,
+    constraintConflictDetected: probes?.constraintConflictDetected ?? false,
+    constraintConflictAcknowledged: probes?.constraintConflictAcknowledged ?? false,
     notes,
   };
+}
+
+/**
+ * Runs one deterministic probe evaluation (paraphrase / distractor variant)
+ * and returns response texts keyed by model. Evidence/conflict/uncertainty
+ * stages are disabled — probes only need the raw answers for comparison.
+ */
+async function runProbeEvaluation(
+  userId: string,
+  prompt: string,
+  modelKeys: string[],
+  runs: number,
+): Promise<Map<string, string[]>> {
+  const evaluationId = await createEvaluation({
+    userId,
+    question: prompt,
+    domain: 'reasoning',
+    taskType: 'adversarial',
+    evaluationMode: 'adversarial',
+    modelKeys,
+    runs,
+    enableConflicts: false,
+    enableEvidence: false,
+    enableUncertainty: false,
+  });
+  await waitForEvaluation(evaluationId);
+  const full = await getEvaluationResults(evaluationId);
+  const byModel = new Map<string, string[]>();
+  for (const m of full?.models ?? []) {
+    byModel.set(m.modelKey, m.responses.map((r) => r.text));
+  }
+  return byModel;
 }
 
 /**
@@ -177,7 +262,18 @@ router.post('/run', async (req: Request, res: Response) => {
   const full = await getEvaluationResults(evaluationId);
 
   const results = (full?.models ?? []).map((m) => {
-    const score = scoreAdversarialModel(m, categoryId);
+    // Constraint-conflict check on the user's own probe (no extra model calls).
+    const conflict = detectConstraintConflict(prompt);
+    const probes: AdversarialProbes = {
+      paraphraseConsistency: null,
+      distractorResistance: null,
+      constraintConflictDetected: conflict.hasConflict,
+      constraintConflictDescription: conflict.description,
+      constraintConflictAcknowledged: conflict.hasConflict
+        ? m.responses.map((r) => r.text).some(responseAcknowledgesConflict)
+        : false,
+    };
+    const score = scoreAdversarialModel(m, categoryId, probes);
     const latencies = m.responses.map((r) => r.latencyMs).filter((l): l is number => typeof l === 'number');
     return {
       ...score,
@@ -233,7 +329,55 @@ router.post('/test', async (req: Request, res: Response) => {
     await waitForEvaluation(evaluationId);
     const full = await getEvaluationResults(evaluationId);
 
-    const models = (full?.models ?? []).map((m) => scoreAdversarialModel(m, category.id));
+    // --- Deterministic robustness probes (2026-10-11): no AI grading. ---
+    // 1. Paraphrase: same question reworded two ways — answers should match.
+    // 2. Distractor: irrelevant paragraph injected — answers should stay on-topic.
+    // 3. Constraint conflict: contradictory instructions in the prompt itself.
+    const paraphrases = paraphrasePrompt(category.prompt);
+    const paraphraseByModel = new Map<string, string[]>();
+    for (const variant of paraphrases) {
+      const byModel = await runProbeEvaluation(req.user!.id, variant, modelKeys, runs);
+      for (const [k, texts] of byModel) {
+        paraphraseByModel.set(k, [...(paraphraseByModel.get(k) ?? []), ...texts]);
+      }
+    }
+    const distractedByModel = await runProbeEvaluation(
+      req.user!.id,
+      distractorPrompt(category.prompt),
+      modelKeys,
+      runs,
+    );
+    const conflict = detectConstraintConflict(category.prompt);
+
+    const models = (full?.models ?? []).map((m) => {
+      const baseTexts = m.responses.map((r) => r.text);
+      const probes: AdversarialProbes = {
+        paraphraseConsistency: null,
+        distractorResistance: null,
+        constraintConflictDetected: conflict.hasConflict,
+        constraintConflictDescription: conflict.description,
+        constraintConflictAcknowledged: false,
+      };
+      const probeTexts = paraphraseByModel.get(m.modelKey) ?? [];
+      if (probeTexts.length > 0 && baseTexts.length > 0) {
+        const pc = probeConsistencyScore(baseTexts, probeTexts);
+        probes.paraphraseConsistency = pc.score;
+        probes.paraphraseExplanation = pc.explanation;
+      }
+      const distractedTexts = distractedByModel.get(m.modelKey) ?? [];
+      if (distractedTexts.length > 0 && baseTexts.length > 0) {
+        const baseRel = baseTexts.reduce((a, t) => a + calculateRelevance(category.prompt, t), 0) / baseTexts.length;
+        const distRel =
+          distractedTexts.reduce((a, t) => a + calculateRelevance(category.prompt, t), 0) / distractedTexts.length;
+        const dr = distractorResistanceScore(baseRel, distRel);
+        probes.distractorResistance = dr.score;
+        probes.distractorExplanation = dr.explanation;
+      }
+      if (conflict.hasConflict) {
+        probes.constraintConflictAcknowledged = baseTexts.some(responseAcknowledgesConflict);
+      }
+      return scoreAdversarialModel(m, category.id, probes);
+    });
 
     results.push({
       categoryId: category.id,

@@ -3,6 +3,7 @@ import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
 import { Badge, Button, Card, ErrorState, LoadingState, ProgressBar } from '../components/ui/index';
 import { evaluationsApi, rerunEvaluation, toApiError } from '../lib/api';
+import { formatInr } from '../lib/utils';
 import type { EvaluationStatus } from '../types';
 
 function fmtMs(ms: number | null | undefined): string {
@@ -13,7 +14,7 @@ function fmtMs(ms: number | null | undefined): string {
 
 function fmtCost(c: number | null | undefined): string {
   if (c == null || Number.isNaN(c)) return 'Unavailable';
-  return `$${c.toFixed(4)}`;
+  return formatInr(c);
 }
 
 const STATUS_META = {

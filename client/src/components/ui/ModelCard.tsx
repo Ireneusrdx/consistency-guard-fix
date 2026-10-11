@@ -1,5 +1,5 @@
 import type { ModelInfo } from '../../types';
-import { cn } from '../../lib/utils';
+import { cn, formatInr } from '../../lib/utils';
 import { Badge } from './Badge';
 
 export interface ModelCardProps {
@@ -17,7 +17,7 @@ function formatContextLength(tokens: number | null | undefined): string {
 
 function formatCost(costPer1k: number | null | undefined): string {
   if (costPer1k == null) return '—';
-  return `$${costPer1k.toFixed(2)} / 1k tokens`;
+  return `${formatInr(costPer1k)} / 1k tokens`;
 }
 
 const speedBadge: Record<ModelInfo['speed'], { variant: 'success' | 'warning' | 'default'; label: string }> = {

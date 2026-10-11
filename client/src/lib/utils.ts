@@ -40,6 +40,22 @@ export function formatUsd(usd: number | null | undefined): string {
   return `$${usd.toFixed(2)}`;
 }
 
+/**
+ * USD → INR rate. Verified 2026-10-11 (xe.com mid-market: 1 USD = 96.73 INR).
+ * Approximate — the rate moves daily. Costs derived from it are estimates.
+ */
+export const USD_INR_RATE = 96.73;
+
+/** Formats a USD cost as approximate INR (₹). */
+export function formatInr(usd: number | null | undefined): string {
+  if (usd == null || Number.isNaN(usd)) return 'Unavailable';
+  const inr = usd * USD_INR_RATE;
+  if (inr === 0) return '₹0.00';
+  if (inr < 0.01) return `₹${inr.toFixed(4)}`;
+  if (inr < 1000) return `₹${inr.toFixed(2)}`;
+  return `₹${inr.toLocaleString('en-IN', { maximumFractionDigits: 2 })}`;
+}
+
 export function formatTokens(n: number | null | undefined): string {
   if (n == null || Number.isNaN(n)) return 'Unavailable';
   return n.toLocaleString();

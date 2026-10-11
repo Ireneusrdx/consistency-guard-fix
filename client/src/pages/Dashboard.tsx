@@ -64,7 +64,7 @@ import {
   Reveal,
 } from '../components/ui';
 import { cn } from '../lib/utils';
-import { formatDate, formatMs, formatUsd, truncate } from '../lib/utils';
+import { formatDate, formatMs, formatInr, truncate } from '../lib/utils';
 import { usePrefersReducedMotion } from '../lib/motion';
 
 // Chart series: solid medium blue + light blue (dark-mode palette).
@@ -450,7 +450,7 @@ function BreakdownCard({ data }: { data: DashboardData }) {
         : 'No domain measurements yet.',
     cost:
       data.costByModel.length > 0
-        ? `Total estimated spend: ${formatUsd(data.costByModel.reduce((a, c) => a + c.costUsd, 0))}.`
+        ? `Total estimated spend: ${formatInr(data.costByModel.reduce((a, c) => a + c.costUsd, 0))}.`
         : 'No cost data recorded yet.',
     latency:
       data.latencyByModel.length > 0
@@ -517,8 +517,8 @@ function BreakdownCard({ data }: { data: DashboardData }) {
                 <BarChart data={data.costByModel} margin={{ top: 8, right: 16, bottom: 4, left: -8 }}>
                   <CartesianGrid strokeDasharray="3 3" stroke={GRID_STROKE} vertical={false} />
                   <XAxis dataKey="model" tick={TICK_STYLE} axisLine={false} tickLine={false} />
-                  <YAxis tick={TICK_STYLE} tickFormatter={(v: number) => `$${v.toFixed(2)}`} axisLine={false} tickLine={false} />
-                  <Tooltip content={<ChartTooltip formatter={(v) => [formatUsd(v), 'Cost']} />} />
+                  <YAxis tick={TICK_STYLE} tickFormatter={(v: number) => formatInr(v)} axisLine={false} tickLine={false} />
+                  <Tooltip content={<ChartTooltip formatter={(v) => [formatInr(v as number), 'Cost']} />} />
                   <Bar dataKey="costUsd" name="Cost" fill={INK} radius={[4, 4, 0, 0]} isAnimationActive={false} />
                 </BarChart>
               ) : (

@@ -18,6 +18,7 @@ import {
 import { EvidenceCard } from '../components/ui/EvidenceCard';
 import { useToast } from '../components/ui/Toast';
 import { evaluationsApi, toApiError } from '../lib/api';
+import { formatInr } from '../lib/utils';
 import type { ResultsData } from '../types';
 
 function fmtMs(ms: number | null | undefined): string {
@@ -28,7 +29,7 @@ function fmtMs(ms: number | null | undefined): string {
 
 function fmtCost(c: number | null | undefined): string {
   if (c == null || Number.isNaN(c)) return 'Unavailable';
-  return `$${c.toFixed(4)}`;
+  return formatInr(c);
 }
 
 function formatConfidence(c: number): string {

@@ -1,5 +1,6 @@
 import { jaccardSimilarity, tokenSet } from './normalize';
 import { ExtractedClaim } from './claims';
+import { detailedSimilarityMatrix } from './deterministic';
 
 export interface ConsistencyResult {
   /** 0..100 */
@@ -8,6 +9,18 @@ export interface ConsistencyResult {
   stablePairs: number;
   totalPairs: number;
   explanation: string;
+  /**
+   * Mean pairwise score per deterministic measure (2026-10-11 rebuild):
+   * jaccard / tfidf / rougeL / levenshtein / composite. Lets the UI show
+   * *why* two runs were judged similar, instead of a single black-box number.
+   */
+  measureMeans?: {
+    jaccard: number;
+    tfidf: number;
+    rougeL: number;
+    levenshtein: number;
+    composite: number;
+  };
 }
 
 /**
@@ -40,8 +53,13 @@ export function claimOverlapSimilarity(a: ExtractedClaim[], b: ExtractedClaim[])
 }
 
 /**
- * Semantic consistency across repeated runs:
- * score = mean of (0.7 * text similarity + 0.3 * claim overlap) over pairs.
+ * Semantic consistency across repeated runs.
+ *
+ * Text similarity per pair is the deterministic 4-measure composite
+ * (TF-IDF cosine 0.35 + ROUGE-L 0.3 + Jaccard 0.25 + word-level Levenshtein 0.1),
+ * blended 0.7/0.3 with claim overlap — the same structure as before, but each
+ * component is now an explainable formula instead of a single Jaccard number.
+ * No LLM or embedding model is involved at any step.
  */
 export function calculateConsistency(
   texts: string[],
@@ -57,7 +75,8 @@ export function calculateConsistency(
       explanation: 'Only one run was produced, so consistency is trivially 100.',
     };
   }
-  const pairwise = pairwiseConsistency(texts);
+  const detail = detailedSimilarityMatrix(texts);
+  const pairwise = detail.composite;
   let sum = 0;
   let stablePairs = 0;
   let totalPairs = 0;
@@ -72,12 +91,23 @@ export function calculateConsistency(
     }
   }
   const score = Math.round((sum / totalPairs) * 100);
+  const mm = detail.meanByMeasure;
   return {
     score,
     pairwise,
     stablePairs,
     totalPairs,
-    explanation: `${stablePairs}/${totalPairs} run pairs were semantically aligned (similarity ≥ 0.55).`,
+    explanation:
+      `${stablePairs}/${totalPairs} run pairs were semantically aligned (similarity ≥ 0.55). ` +
+      `Mean pairwise — TF-IDF ${Math.round(mm.tfidf * 100)}, ROUGE-L ${Math.round(mm.rougeL * 100)}, ` +
+      `Jaccard ${Math.round(mm.jaccard * 100)}, edit ${Math.round(mm.levenshtein * 100)}.`,
+    measureMeans: {
+      jaccard: Math.round(mm.jaccard * 100),
+      tfidf: Math.round(mm.tfidf * 100),
+      rougeL: Math.round(mm.rougeL * 100),
+      levenshtein: Math.round(mm.levenshtein * 100),
+      composite: Math.round(mm.composite * 100),
+    },
   };
 }
 

@@ -27,6 +27,7 @@ import {
 import { ConflictCard } from '../components/ui/ConflictCard';
 import { Markdown } from '../components/Markdown';
 import { EvidenceCard } from '../components/ui/EvidenceCard';
+import { formatInr } from '../lib/utils';
 import { useToast } from '../components/ui/Toast';
 import { evaluationsApi, reportsApi, toApiError } from '../lib/api';
 import type { ResultsData } from '../types';
@@ -39,7 +40,7 @@ function fmtMs(ms: number | null | undefined): string {
 
 function fmtCost(c: number | null | undefined): string {
   if (c == null || Number.isNaN(c)) return 'Unavailable';
-  return `$${c.toFixed(4)}`;
+  return formatInr(c);
 }
 
 function formatConfidence(c: number): string {

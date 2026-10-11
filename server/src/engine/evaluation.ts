@@ -6,10 +6,12 @@ import {
   getProviderIdForModel,
 } from '../providers/registry';
 import { fetchLiveModels } from '../providers/liveModels';
+import { ensurePollinationsPricing } from '../providers/pollinations';
 import { GenerationResult, ProviderError } from '../providers/types';
 import { normalizeText } from './normalize';
 import { extractClaims, ExtractedClaim } from './claims';
 import { calculateConsistency, crossModelAgreement } from './consistency';
+import { claimConsistencyScore, numericAgreementScore } from './deterministic';
 import { detectConflicts, ClaimWithModel } from './conflicts';
 import { retrieveEvidence, verifyClaim } from './evidence';
 import { analyzeUncertainty } from './uncertainty';
@@ -27,7 +29,10 @@ import {
   checkFormatGates,
   applyGateCap,
 } from './scoring';
-import { judgeOneResponse, isJudgeEnabled, getJudgeModelKey, JudgeVerdict } from './judge';
+// JUDGE-DISABLED (2026-10-11, user decision): deterministic scoring only —
+// no LLM or AI model grades responses. The judge module (./judge.ts) is kept
+// in the tree for reference, but nothing imports it anymore.
+// import { judgeOneResponse, isJudgeEnabled, getJudgeModelKey, JudgeVerdict } from './judge';
 import { analyzePrompt, optimizePrompt } from './promptAnalysis';
 import { jsonStringify, jsonParse } from '../utils/json';
 
@@ -254,6 +259,10 @@ export async function executeEvaluation(evaluationId: string, req?: EvaluationRe
 
   await prisma.evaluation.update({ where: { id: evaluationId }, data: { status: 'running' } });
 
+  // Warm the live Pollinations per-token pricing cache so per-run cost
+  // estimates use real prices. No-op when cached (6h TTL); never throws.
+  await ensurePollinationsPricing().catch(() => undefined);
+
   // --- Prompt analysis (persisted for the results page) ---
   const promptAnalysis = analyzePrompt(question);
   const optimized = optimizePrompt(question, promptAnalysis);
@@ -273,9 +282,10 @@ export async function executeEvaluation(evaluationId: string, req?: EvaluationRe
   });
 
   // --- Provider selection ---
-  // The judge model key rides along so its credential resolves the same way.
-  const judgeModelKey = getJudgeModelKey();
-  const creds = await resolveCredentials(userId, [...new Set([...modelKeys, judgeModelKey])]);
+  // JUDGE-DISABLED (2026-10-11): the judge model key no longer rides along —
+  // only the evaluated models' credentials are resolved.
+  // const judgeModelKey = getJudgeModelKey();
+  const creds = await resolveCredentials(userId, [...new Set([...modelKeys])]);
 
   // --- Repeated model calls (parallel across models, sequential runs) ---
   const runRows = await prisma.evaluationRun.findMany({ where: { evaluationId } });
@@ -499,10 +509,20 @@ export async function executeEvaluation(evaluationId: string, req?: EvaluationRe
     // checkFormatGates() and cap instruction-following when violated. If the
     // judge is disabled, unreachable, or returns unparseable output, the
     // legacy heuristics below run instead — transparently, never silently.
+    /* ========================================================================
+     * JUDGE-DISABLED (2026-10-11, user decision): LLM-as-judge scoring removed.
+     * Relevance, completeness, instruction-following, and accuracy are now
+     * computed SOLELY by deterministic formulas (scoring.ts, deterministic.ts).
+     * The original judge code is preserved below for reference — it must not
+     * be re-enabled without the user's explicit approval.
+     * ----------------------------------------------------------------------
     const judgeCred = creds.get(judgeModelKey);
     const judgeApiKey = judgeCred?.apiKey;
     let judgeUsed = false;
     let judgeVerdicts: JudgeVerdict[] = [];
+    // Why the judge path was skipped — surfaced in metric explanations so
+    // heuristic fallback scores never masquerade as judge grades.
+    let judgeFallbackReason: string | null = null;
     if (isJudgeEnabled() && judgeApiKey) {
       const settled = await Promise.all(
         texts.map((t) =>
@@ -517,11 +537,27 @@ export async function executeEvaluation(evaluationId: string, req?: EvaluationRe
         ),
       );
       judgeVerdicts = settled.filter((v) => v.ok);
-      judgeUsed = judgeVerdicts.length > 0;
+      // All-or-nothing: the filtered verdicts no longer align with texts by
+      // index, and mixing judge grades with heuristic proxies inside one
+      // model's metrics would be misleading. Any judge failure falls back to
+      // heuristics for this model, clearly marked as estimated.
+      judgeUsed = judgeVerdicts.length === texts.length && texts.length > 0;
       if (!judgeUsed) {
-        console.warn(`[evaluation ${evaluationId}] judge produced no usable verdicts for ${m.modelKey}; using heuristic fallback.`);
+        judgeFallbackReason = `LLM judge returned ${judgeVerdicts.length} of ${texts.length} usable verdict(s)`;
+        console.warn(
+          `[evaluation ${evaluationId}] judge produced ${judgeVerdicts.length}/${texts.length} usable verdicts for ${m.modelKey}; using heuristic fallback.`,
+        );
       }
+    } else if (!isJudgeEnabled()) {
+      judgeFallbackReason = 'judge disabled (JUDGE_ENABLED=false)';
+    } else {
+      judgeFallbackReason = `no API credential configured for judge model ${judgeModelKey}`;
     }
+     * ========================================================================
+     */
+
+    // Deterministic-only scoring (2026-10-11): the LLM judge never runs.
+    // Every score below is a traceable formula, never an AI grade.
 
     const avg = (vals: number[]): number =>
       vals.length === 0 ? 0 : Math.round(vals.reduce((a, b) => a + b, 0) / vals.length);
@@ -533,6 +569,9 @@ export async function executeEvaluation(evaluationId: string, req?: EvaluationRe
     let completenessExplanation: string | undefined;
     let instructionFollowingExplanation: string | undefined;
 
+    /* JUDGE-DISABLED (2026-10-11): LLM-graded relevance/completeness/
+     * instruction-following removed. Preserved for reference.
+     * ----------------------------------------------------------------------
     if (judgeUsed) {
       relevance = avg(judgeVerdicts.map((v) => v.relevance.score));
       completeness = avg(judgeVerdicts.map((v) => v.completeness.score));
@@ -557,18 +596,34 @@ export async function executeEvaluation(evaluationId: string, req?: EvaluationRe
         (failedGateNames.length > 0 ? ` Failed gates: ${failedGateNames.join(', ')}.` : '') +
         (reason((v) => v.instructionFollowing.reasoning) ? ` ${reason((v) => v.instructionFollowing.reasoning)}` : '');
     } else {
-      // Legacy heuristic fallback (judge disabled or unavailable).
+     * ----------------------------------------------------------------------
+     */
+    {
+      // Deterministic scoring (2026-10-11): explainable heuristic formulas.
       relevance = Math.round(texts.reduce((a, t) => a + calculateRelevance(question, t), 0) / texts.length);
       completeness = Math.round(texts.reduce((a, t) => a + calculateCompleteness(question, t), 0) / texts.length);
       instructionFollowing = Math.round(
         texts.reduce((a, t) => a + calculateInstructionFollowing(question, t, systemInstructions), 0) / texts.length,
       );
+      relevanceExplanation =
+        'Deterministic keyword-coverage score: share of the question\u2019s content words ' +
+        'that appear in the response (length-normalized). No AI grading involved.';
+      completenessExplanation =
+        'Deterministic prompt-coverage score: share of the question\u2019s aspects ' +
+        '(split on commas/and) addressed in the response. No AI grading involved.';
+      instructionFollowingExplanation =
+        'Deterministic constraint-check score: measurable instructions ' +
+        '(word limits, JSON validity, list markers) verified by format gates. ' +
+        'No AI grading involved.';
     }
 
     let accuracy: number | null = null;
     let accuracyIsEstimated = true;
     let accuracyExplanation: string | undefined;
     if (referenceAnswer && referenceAnswer.trim()) {
+      /* JUDGE-DISABLED (2026-10-11): reference-guided LLM grading removed.
+       * Preserved for reference.
+       * --------------------------------------------------------------------
       if (judgeUsed) {
         const accScores = judgeVerdicts.map((v) => v.accuracy?.score).filter((s): s is number => typeof s === 'number');
         if (accScores.length > 0) {
@@ -577,10 +632,15 @@ export async function executeEvaluation(evaluationId: string, req?: EvaluationRe
           accuracyExplanation = `Reference-guided LLM grading vs the provided reference answer (judge: ${judgeVerdicts[0]?.judgeModel ?? judgeModelKey}).`;
         }
       }
+       * --------------------------------------------------------------------
+       */
       if (accuracy === null) {
         accuracy = Math.round(texts.reduce((a, t) => a + calculateGroundTruthAccuracy(t, referenceAnswer), 0) / texts.length);
-        accuracyIsEstimated = false;
-        accuracyExplanation = 'Ground-truth accuracy vs the provided reference answer.';
+        // Token-overlap heuristic, not judge grading — marked estimated.
+        accuracyIsEstimated = true;
+        accuracyExplanation =
+          'Deterministic token-overlap vs the reference answer — an estimate of ' +
+          'surface similarity, not a grade of correctness. No AI grading involved.';
       }
     } else {
       accuracy = agreementByModel.get(m.modelKey) ?? 0;
@@ -606,11 +666,12 @@ export async function executeEvaluation(evaluationId: string, req?: EvaluationRe
     const push = (metricName: string, value: number, isEstimated = false, explanation?: string) =>
       metricRows.push({ modelKey: m.modelKey, modelId: modelRow?.id, metricName, value, isEstimated, explanation });
 
-    if (judgeUsed) {
-      reliability.explanation.push(
-        'Relevance, completeness, and instruction-following were graded by an LLM judge against a written rubric; exact format constraints were checked deterministically.',
-      );
-    }
+    // Deterministic scoring (2026-10-11): every metric below is an explainable
+    // formula — no LLM or AI model grades any response.
+    reliability.explanation.push(
+      'Relevance, completeness, and instruction-following are deterministic formula scores ' +
+      '(keyword coverage, prompt-aspect coverage, format-gate checks) — traceable computations, not AI grades.',
+    );
 
     push('accuracy', accuracy ?? 0, accuracyIsEstimated, accuracyExplanation);
     push('consistency', consistency.score, false, consistency.explanation);
@@ -622,6 +683,24 @@ export async function executeEvaluation(evaluationId: string, req?: EvaluationRe
     push('hallucinationRisk', hallucinationRisk, false, `${contradicted} contradicted claim(s); uncertainty score ${uncertainty.uncertaintyScore}.`);
     push('uncertainty', uncertainty.uncertaintyScore, false, uncertainty.flags.join(' ') || 'No significant uncertainty detected.');
     push('crossModelAgreement', agreementByModel.get(m.modelKey) ?? 0);
+    // 4-measure consistency breakdown (free — already computed inside calculateConsistency).
+    if (consistency.measureMeans) {
+      const mm = consistency.measureMeans;
+      push('consistencyTfidf', mm.tfidf, false,
+        `Mean pairwise TF-IDF cosine similarity (${mm.tfidf}/100): shared distinctive vocabulary across runs.`);
+      push('consistencyRougeL', mm.rougeL, false,
+        `Mean pairwise ROUGE-L F1 (${mm.rougeL}/100): shared phrasing / word order across runs.`);
+    }
+    // Deeper deterministic metrics for the consistency/deep/adversarial modes.
+    // Quick mode stays lean: base metrics + the 4-measure breakdown above.
+    if (mode !== 'quick') {
+      const claimConsistency = claimConsistencyScore(runClaims);
+      push('claimConsistency', claimConsistency.score, false, claimConsistency.explanation);
+      const numericAgreement = numericAgreementScore(texts);
+      if (numericAgreement.score !== null) {
+        push('numericAgreement', numericAgreement.score, false, numericAgreement.explanation);
+      }
+    }
 
     const modelCost = m.results.reduce((a, r) => a + (r.inputTokens + r.outputTokens), 0);
     void modelCost;
