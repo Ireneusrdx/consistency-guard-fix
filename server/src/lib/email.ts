@@ -1,15 +1,18 @@
 /**
- * Email delivery via Gmail SMTP (nodemailer) — free, no custom domain needed.
+ * Email delivery via Brevo SMTP (nodemailer) — sends from your own domain.
  *
- * Graceful when unconfigured: if GMAIL_USER / GMAIL_APP_PASSWORD are missing,
- * sends are skipped with a server-side warning instead of throwing, so local
- * dev and misconfigured deploys never crash the request path.
+ * Graceful when unconfigured: if SMTP_HOST / SMTP_USER / SMTP_PASS are
+ * missing, sends are skipped with a server-side warning instead of throwing,
+ * so local dev and misconfigured deploys never crash the request path.
  *
  * Setup (one time):
- *   1. Google Account → Security → turn ON 2-Step Verification.
- *   2. Security → App passwords → generate one for "Mail".
- *   3. Set GMAIL_USER to your Gmail address and GMAIL_APP_PASSWORD to the
- *      16-character app password (NOT your real Google password).
+ *   1. Brevo dashboard → SMTP & API → generate an SMTP key (shown once).
+ *   2. Set SMTP_HOST=smtp-relay.brevo.com, SMTP_PORT=587,
+ *      SMTP_USER=<your Brevo login email>, SMTP_PASS=<the SMTP key>.
+ *   3. Set EMAIL_FROM to a sender on your authenticated domain,
+ *      e.g. hello@consistencyguard.me.
+ *   4. Set FRONTEND_URL=https://app.consistencyguard.me so reset links
+ *      point at your domain.
  */
 import * as nodemailer from 'nodemailer';
 import dns from 'node:dns/promises';
@@ -18,48 +21,50 @@ import { LOGO_PNG_BASE64 } from './logoImage';
 let transporter: nodemailer.Transporter | null = null;
 
 async function getTransporter(): Promise<nodemailer.Transporter | null> {
-  const user = process.env.GMAIL_USER;
-  const pass = process.env.GMAIL_APP_PASSWORD;
-  if (!user || !pass) return null;
+  const host = process.env.SMTP_HOST;
+  const port = Number(process.env.SMTP_PORT || 587);
+  const user = process.env.SMTP_USER;
+  const pass = process.env.SMTP_PASS;
+  if (!host || !user || !pass) return null;
   if (!transporter) {
     // Render's containers have no IPv6 route to the open internet. Node's
-    // DNS lookup can return Gmail's IPv6 address first → ENETUNREACH on
-    // every send. Resolve to IPv4 explicitly so the connection is reliable.
-    let host = 'smtp.gmail.com';
+    // DNS lookup can return an IPv6 address first → ENETUNREACH on every
+    // send. Resolve to IPv4 explicitly so the connection is reliable.
+    let resolved = host;
     try {
-      const v4 = await dns.resolve4('smtp.gmail.com');
-      if (v4.length > 0) host = v4[0];
+      const v4 = await dns.resolve4(host);
+      if (v4.length > 0) resolved = v4[0];
     } catch {
       // fall through to the hostname; nodemailer will resolve it
     }
     transporter = nodemailer.createTransport({
-      host,
-      port: 465,
-      secure: true,
+      host: resolved,
+      port,
+      secure: port === 465,
       auth: { user, pass },
       // connecting by IP: keep TLS cert verification against the real name
-      tls: { servername: 'smtp.gmail.com' },
+      tls: { servername: host },
       // Render's free tier can be slow/flaky — generous timeouts plus
       // retry below instead of failing on the first hiccup.
       connectionTimeout: 30000,
       greetingTimeout: 30000,
       socketTimeout: 45000,
     });
-    console.log(`[email] Gmail SMTP transporter ready (host=${host}, ipv4-forced)`);
+    console.log(`[email] SMTP transporter ready (host=${resolved}, ipv4-forced)`);
   }
   return transporter;
 }
 
 export function isEmailConfigured(): boolean {
-  return Boolean(process.env.GMAIL_USER && process.env.GMAIL_APP_PASSWORD);
+  return Boolean(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS);
 }
 
 /** Send a password-reset email. Throws only when the SMTP send fails. */
 export async function sendPasswordResetEmail(to: string, resetUrl: string): Promise<void> {
   const mailer = await getTransporter();
-  const fromAddr = process.env.EMAIL_FROM || process.env.GMAIL_USER;
+  const fromAddr = process.env.EMAIL_FROM;
   if (!mailer || !fromAddr) {
-    console.warn('[email] GMAIL_USER or GMAIL_APP_PASSWORD is not set — skipping password reset email');
+    console.warn('[email] SMTP_HOST/SMTP_USER/SMTP_PASS or EMAIL_FROM is not set — skipping password reset email');
     return;
   }
   const mailOptions = {
