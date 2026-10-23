@@ -35,13 +35,46 @@ Local dev login (after `npm run seed`): `demo@consistency.guard` / `Demo123!@`
 
 ## Architecture
 
+Full details, evaluation flow and design decisions: **[docs/architecture.md](docs/architecture.md)**
+
+```mermaid
+flowchart TB
+    User([User])
+
+    subgraph Client["Client — React 19 + TypeScript + Vite"]
+        Pages["16 pages: Auth, Dashboard, Evaluate,<br/>Results, Compare, History, Benchmarks,<br/>Adversarial, Prompt Intelligence, Reports, Settings"]
+    end
+
+    subgraph Server["Server — Node.js + Express + TypeScript"]
+        Routes["REST API — /api/auth, /api/evaluations,<br/>/api/providers, /api/dashboard, /api/benchmarks,<br/>/api/prompts, /api/adversarial, /api/reports"]
+        Engine["Evaluation Engine<br/>Repeated runs → Normalize → Claims →<br/>Conflicts → Evidence → Deterministic Scoring<br/>TF-IDF, ROUGE-L, Levenshtein, claim-majority,<br/>numeric/date agreement — no LLM grades itself"]
+        Security["JWT sessions · bcrypt · Rate limiting<br/>AES-256-GCM encrypted provider API keys"]
+        Routes --> Engine
+        Routes --- Security
+    end
+
+    subgraph Data["Data — Prisma ORM"]
+        DB[("Neon PostgreSQL (production)<br/>SQLite (local dev) — 23 tables")]
+    end
+
+    subgraph External["External AI Providers"]
+        Providers["Pollinations (default gateway)<br/>OpenAI · Anthropic · Gemini<br/>Mistral · Llama · Perplexity"]
+    end
+
+    Deploy["Deployment: Render (Docker, single container<br/>serving API + client) · Brevo HTTP API for<br/>password-reset email · consistencyguard.me"]
+
+    User -->|HTTPS| Pages
+    Pages -->|REST / JSON, JWT| Routes
+    Engine --> Providers
+    Routes -->|Prisma Client| DB
+    Engine -->|Prisma Client| DB
+    Server -.-> Deploy
 ```
-client/  React 18 + TS + Vite + Tailwind + React Router + TanStack Query + Recharts
-server/  Node + TS + Express + Prisma + SQLite (Postgres-compatible schema)
-         AES-256-GCM encrypted API keys, JWT sessions, rate-limited auth
-         Provider adapters: pollinations (free gateway, default) / openai / anthropic / gemini / mistral / llama / perplexity
-         Evaluation engine: repeated runs → normalize → claims → conflicts →
-                            evidence → metrics → reliability → explainability
+
+```
+client/  React 19 + TS + Vite + Tailwind + StyleX + React Router + TanStack Query + Recharts
+server/  Node + TS + Express + Prisma — Postgres in production, SQLite locally
+         Evaluation modes: quick / consistency / deep / adversarial
 ```
 
 ## Key routes
